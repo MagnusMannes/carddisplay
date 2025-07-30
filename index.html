@@ -27,8 +27,8 @@
       .barWrap { background: color-mix(in oklab, Canvas 80%, CanvasText 20%); }
     }
     .bar { height: 100%; width: 0; transition: width .25s ease; }
-    .bar.schl { background: #3b82f6; }   /* default browser blue if unsupported */
-    .bar.baker { background: #10b981; }  /* default browser green if unsupported */
+    .bar.schl { background: #3b82f6; }
+    .bar.baker { background: #10b981; }
     .count {
       position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
       font-weight: 700; text-shadow: 0 1px 2px rgb(0 0 0 / .2);
@@ -85,15 +85,19 @@
   // ====== Configuration ======
   const baseUrl = "https://dabsafecard.azurewebsites.net/report?date=today";
 
-  // If CORS blocks you, put your proxy endpoint here (e.g., a Cloudflare Worker)
-  // that forwards the upstream URL given after the slash:
-  //    fetch("https://your-worker.example.workers.dev/" + encodeURIComponent(upstreamUrl))
+  // If CORS blocks you, put your proxy endpoint here
   const proxyUrl = ""; // e.g. "https://your-worker.example.workers.dev"
 
   const needles = {
     schlumberger: "<td>Schlumberger</td>",
     baker: "<td>Baker Hughes</td>"
   };
+
+  // Fixed-scale behavior:
+  // - if max count <= FILL_AT, use 0–FILL_AT (50 fills the bar)
+  // - if max count  > FILL_AT, use 0–OVERFLOW_MAX (switches to 0–100)
+  const FILL_AT = 50;
+  const OVERFLOW_MAX = 100;
 
   // ====== DOM ======
   const statusEl = document.getElementById("status");
@@ -145,10 +149,13 @@
     return fn(ctrl).finally(() => clearTimeout(t));
   }
 
+  // === NEW: fixed-scale + snapshot updates ===
   function updateBars() {
-    const maxVal = Math.max(1, totals.schl, totals.baker);
-    const schlPct = (totals.schl / maxVal) * 100;
-    const bakerPct = (totals.baker / maxVal) * 100;
+    const maxCount = Math.max(totals.schl, totals.baker);
+    const scaleMax = maxCount <= FILL_AT ? FILL_AT : OVERFLOW_MAX;
+
+    const schlPct  = Math.min(100, (totals.schl  / scaleMax) * 100);
+    const bakerPct = Math.min(100, (totals.baker / scaleMax) * 100);
 
     barSchl.style.width  = schlPct + "%";
     barBaker.style.width = bakerPct + "%";
@@ -184,22 +191,31 @@
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
 
       const text = await res.text();
-      const sAdd = countOccurrences(text, needles.schlumberger);
-      const bAdd = countOccurrences(text, needles.baker);
 
-      totals.schl  += sAdd;
-      totals.baker += bAdd;
+      // Count what's on the page RIGHT NOW (snapshot), not cumulative adds
+      const sNow = countOccurrences(text, needles.schlumberger);
+      const bNow = countOccurrences(text, needles.baker);
+
+      // Compute deltas vs. previous totals for history/status only
+      const prev = { ...totals };
+      const sDelta = sNow - prev.schl;
+      const bDelta = bNow - prev.baker;
+
+      // === KEY CHANGE: replace totals with the latest snapshot ===
+      totals.schl  = sNow;
+      totals.baker = bNow;
+
       updateBars();
 
       history.push({
         time: formatTime(started),
         schl_total: totals.schl,
         baker_total: totals.baker,
-        schl_delta: sAdd,
-        baker_delta: bAdd
+        schl_delta: sDelta,
+        baker_delta: bDelta
       });
 
-      setStatus(`Last update ${formatTime()} — +${sAdd} Schlumberger, +${bAdd} Baker Hughes. Totals: ${totals.schl} / ${totals.baker}.`);
+      setStatus(`Last update ${formatTime()} — Δ ${sDelta >= 0 ? "+" + sDelta : sDelta} Schlumberger, ${bDelta >= 0 ? "+" + bDelta : bDelta} Baker Hughes. Totals: ${totals.schl} / ${totals.baker}.`);
     } catch (err) {
       setStatus(`Fetch failed: ${err?.message || err}. If this is a CORS error, set a proxyUrl or enable CORS on the source.`, true);
       console.error(err);
