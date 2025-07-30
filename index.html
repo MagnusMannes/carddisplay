@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Live Counts: Schlumberger vs Baker Hughes</title>
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 16px; line-height: 1.4; }
+    header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
+    h1 { font-size: 1.15rem; margin: 0; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    button, select, input { font: inherit; padding: 6px 10px; }
+    #status { font-size: 0.95rem; opacity: .8; }
+    #chartWrap { max-width: 1100px; }
+    canvas { width: 100% !important; height: 480px !important; }
+    footer { margin-top: 14px; font-size: .9rem; opacity: .8; }
+    .warn { color: #b21; font-weight: 600; }
+  </style>
+  <!-- Chart.js via CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js" integrity="sha384-3g9Qx7F3G6Zwo6oY1eZtAjx1Jc9sSeGg+3lSFr1E5M9LbnQw3tqQYQx1b6Q6Lw+G" crossorigin="anonymous"></script>
+</head>
+<body>
+  <header>
+    <h1>Live counts of &lt;td&gt;Schlumberger&lt;/td&gt; and &lt;td&gt;Baker Hughes&lt;/td&gt;</h1>
+    <div class="controls">
+      <label>Poll every
+        <select id="intervalSelect">
+          <option value="15000">15 sec</option>
+          <option value="30000">30 sec</option>
+          <option value="60000" selected>60 sec</option>
+          <option value="120000">2 min</option>
+          <option value="300000">5 min</option>
+        </select>
+      </label>
+      <button id="startBtn">Start</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <button id="clearBtn">Clear data</button>
+      <button id="downloadBtn">Download CSV</button>
+    </div>
+    <div id="status" aria-live="polite">Idle.</div>
+  </header>
+
+  <div id="chartWrap">
+    <canvas id="chart"></canvas>
+  </div>
+
+  <footer>
+    Source: <code>https://dabsafecard.azurewebsites.net/report?date=today</code>.
+    Counts are exact string matches. If you see a fetch error, it may be due to CORS. See code comments for using a proxy.
+  </footer>
+
+<script>
+(() => {
+  // ====== Configuration ======
+  const baseUrl = "https://dabsafecard.azurewebsites.net/report?date=today";
+
+  // If browser blocks due to CORS, deploy a tiny CORS pass-through (e.g., Cloudflare Worker)
+  // and set proxyUrl to its endpoint, like: "https://your-worker.example.workers.dev/"
+  // The code will fetch proxyUrl + encodeURIComponent(baseUrlWithCacheBuster)
+  const proxyUrl = ""; // leave blank if not needed
+
+  const needles = {
+    schlumberger: "<td>Schlumberger</td>",
+    baker: "<td>Baker Hughes</td>"
+  };
+
+  const maxPoints = 500; // keep last N points
+
+  // ====== DOM elements ======
+  const statusEl = document.getElementById("status");
+  const startBtn = document.getElementById("startBtn");
+  const stopBtn  = document.getElementById("stopBtn");
+  const clearBtn = document.getElementById("clearBtn");
+  const dlBtn    = document.getElementById("downloadBtn");
+  const intervalSelect = document.getElementById("intervalSelect");
+  const ctx = document.getElementById("chart").getContext("2d");
+
+  // ====== Utilities ======
+  function countOccurrences(haystack, needle) {
+    if (!needle) return 0;
+    let count = 0, pos = 0;
+    while ((pos = haystack.indexOf(needle, pos)) !== -1) {
+      count++;
+      pos += needle.length; // non-overlapping exact matches
+    }
+    return count;
+  }
+
+  function formatTime(d) {
+    // ISO-like but short, local time
+    return d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+  }
+
+  function withTimeout(ms, fetchPromise) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), ms);
+    return fetchPromise(ctrl).finally(() => clearTimeout(t));
+  }
+
+  function buildUrl() {
+    const cacheBuster = `_=${Date.now()}`;
+    const urlWithBuster = baseUrl + (baseUrl.includes("?") ? "&" : "?") + cacheBuster;
+    if (proxyUrl) {
+      // Common Worker pattern: treat path as the upstream URL
+      // Many examples forward `?url=` or path; adjust to your Worker shape if needed.
+      // Here we URL-encode the full target URL after the proxy base.
+      return proxyUrl.replace(/\/$/, "") + "/" + encodeURIComponent(urlWithBuster);
+    }
+    return urlWithBuster;
+  }
+
+  function setStatus(text, warn=false) {
+    statusEl.textContent = text;
+    statusEl.className = warn ? "warn" : "";
+  }
+
+  // ====== Chart setup ======
+  const chart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: [],
+      datasets: [
+        {
+          label: "Schlumberger",
+          data: [],
+          borderWidth: 2,
+          pointRadius: 2,
+          tension: 0.25
+        },
+        {
+          label: "Baker Hughes",
+          data: [],
+          borderWidth: 2,
+          pointRadius: 2,
+          tension: 0.25
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      animation: false,
+      interaction: { mode: "nearest", intersect: false },
+      scales: {
+        x: { title: { display: true, text: "Time" } },
+        y: {
+          title: { display: true, text: "Count" },
+          beginAtZero: true,
+          ticks: { precision: 0 }
+        }
+      },
+      plugins: {
+        legend: { position: "top" },
+        tooltip: { callbacks: {
+          // Show both series at the same timestamp
+          title: items => items?.[0]?.label || ""
+        } }
+      }
+    }
+  });
+
+  function addPoint(tsLabel, schl, baker) {
+    chart.data.labels.push(tsLabel);
+    chart.data.datasets[0].data.push(schl);
+    chart.data.datasets[1].data.push(baker);
+
+    // Limit memory / keep chart readable
+    if (chart.data.labels.length > maxPoints) {
+      chart.data.labels.shift();
+      chart.data.datasets.forEach(ds => ds.data.shift());
+    }
+    chart.update();
+  }
+
+  function clearData() {
+    chart.data.labels.length = 0;
+    chart.data.datasets.forEach(ds => ds.data.length = 0);
+    chart.update();
+  }
+
+  function toCSV() {
+    const rows = [["time","schlumberger","baker_hughes"]];
+    const n = chart.data.labels.length;
+    for (let i = 0; i < n; i++) {
+      const t = chart.data.labels[i];
+      const s = chart.data.datasets[0].data[i] ?? "";
+      const b = chart.data.datasets[1].data[i] ?? "";
+      rows.push([t, s, b]);
+    }
+    return rows.map(r => r.map(x =>
+      (typeof x === "string" && x.includes(",")) ? `"${x.replaceAll('"','""')}"` : x
+    ).join(",")).join("\n");
+  }
+
+  // ====== Polling ======
+  let timer = null;
+
+  async function sampleOnce() {
+    const started = new Date();
+    const url = buildUrl();
+
+    try {
+      setStatus("Fetching…");
+      const res = await withTimeout(15000, (ctrl) =>
+        fetch(url, {
+          method: "GET",
+          cache: "no-store",
+          redirect: "follow",
+          signal: ctrl.signal
+        })
+      );
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      }
+
+      const text = await res.text();
+      const schl = countOccurrences(text, needles.schlumberger);
+      const baker = countOccurrences(text, needles.baker);
+
+      addPoint(formatTime(started), schl, baker);
+      setStatus(`Last update ${formatTime(new Date())} — Schlumberger: ${schl}, Baker Hughes: ${baker}`);
+    } catch (err) {
+      // Common cause is CORS; surface a helpful hint
+      setStatus(`Fetch failed: ${err?.message || err}. If this is a CORS error, set ` +
+                `a proxyUrl in the code (see comment) or enable CORS on the source.`, true);
+      console.error(err);
+    }
+  }
+
+  function startPolling() {
+    if (timer) return;
+    sampleOnce(); // immediate
+    const intervalMs = parseInt(intervalSelect.value, 10) || 60000;
+    timer = setInterval(sampleOnce, intervalMs);
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    setStatus("Polling started.");
+  }
+
+  function stopPolling() {
+    if (!timer) return;
+    clearInterval(timer);
+    timer = null;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    setStatus("Polling stopped.");
+  }
+
+  // ====== Events ======
+  startBtn.addEventListener("click", startPolling);
+  stopBtn.addEventListener("click", stopPolling);
+  clearBtn.addEventListener("click", () => { clearData(); setStatus("Data cleared."); });
+  dlBtn.addEventListener("click", () => {
+    const csv = toCSV();
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "counts.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+
+  intervalSelect.addEventListener("change", () => {
+    if (timer) {
+      // Restart with the new interval
+      stopPolling();
+      startPolling();
+    }
+  });
+
+  // Auto-start on load
+  startPolling();
+})();
+</script>
+</body>
+</html>
